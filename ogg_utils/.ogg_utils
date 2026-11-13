@@ -1,0 +1,381 @@
+#!/usr/bin/env bash
+# shellcheck shell=bash
+#
+##
+## Functions specific for managing Oracle GoldenGate 26ai on Linux
+##
+## NOTE: This file is meant to be SOURCED, not executed. Add the following
+##       to ~/.bashrc of the GoldenGate OS user (e.g. oracle):
+##
+##  if [[ -f /home/oracle/.ogg_utils ]]; then
+##      . /home/oracle/.ogg_utils
+##  fi
+##
+## Author: Parsa Bahrami (pb) - 20261008
+##
+##
+## Update Tracker:
+#  Date       Initials     Note
+# ----------------------------------------------------------------------------------
+#  20261008    pb           Initial Release - includes the basic ogg_list_deployments
+#  20261112    pb           Replaced ogg_list_deployment with oggenv
+#  20261113    pb           Add auto-completion (Tab key) to oggenv
+#  20261113    pb           Fixed header/.bashrc example path, removed ineffective
+#                           '-e' from shebang, added guard against direct execution,
+#                           corrected oggenv description, converted ggac_/cdgg
+#                           aliases to functions that resolve $OGG_HOME at run time
+#
+#
+
+# Guard: this file must be sourced. Executing it would set variables in a
+# subshell that disappears on exit, so stop and tell the user instead.
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    echo "Error: ${0##*/} must be sourced, not executed." >&2
+    echo "Usage: . ${0}" >&2
+    exit 1
+fi
+
+
+######################################################################
+#####                         OGG Helpers                       ######
+######################################################################
+
+# Remove any aliases left over from older versions of this file (or from the
+# user's own profile) so the function definitions below are not alias-expanded.
+unalias ggac_ cdgg 2>/dev/null
+
+# DESC: Launch the GoldenGate Admin Client from the currently loaded $OGG_HOME.
+#       Resolves $OGG_HOME each time it runs, so it follows 'oggenv' switches.
+function ggac_ {
+    if [[ -z "${OGG_HOME:-}" ]]; then
+        echo "Error: OGG_HOME is not set. Run 'oggenv <deployment>' first." >&2
+        return 1
+    fi
+    if [[ ! -x "$OGG_HOME/bin/adminclient" ]]; then
+        echo "Error: adminclient not found or not executable at $OGG_HOME/bin/adminclient" >&2
+        return 1
+    fi
+    "$OGG_HOME/bin/adminclient" "$@"
+}
+
+# DESC: Change directory to the currently loaded $OGG_HOME.
+#       Resolves $OGG_HOME each time it runs, so it follows 'oggenv' switches.
+function cdgg {
+    if [[ -z "${OGG_HOME:-}" ]]; then
+        echo "Error: OGG_HOME is not set. Run 'oggenv <deployment>' first." >&2
+        return 1
+    fi
+    cd "$OGG_HOME" || return 1
+}
+
+
+
+######################################################################
+#####                         OGG Functions                     ######
+######################################################################
+
+#==============================================================================
+# oggenv - Oracle GoldenGate Microservices Environment & Registry Utility
+#
+# Usage:
+#   oggenv                                  List available deployment names
+#   oggenv <deployment>                     Export environment variables
+#   oggenv -l, --list                       Show full details for all deployments
+#   oggenv -g, --get <deployment> [param]   Show deployment details or param value
+#   oggenv -r, --registry <path>            Specify custom SM home or .dat path
+# ==============================================================================
+
+# DESC: Resolve the path to deploymentRegistry.dat.
+#       No argument -> use inventory_loc from /etc/oggInst.loc
+#       File path   -> use it as-is
+#       SM home     -> use <path>/etc/conf/deploymentRegistry.dat
+_ogg_find_registry() {
+    local input_path="$1"
+
+    if [[ -z "$input_path" && -f "/etc/oggInst.loc" ]]; then
+        local conf_dir
+        conf_dir=$(awk -F'=' '/^inventory_loc/{print $2}' /etc/oggInst.loc | xargs)
+        echo "${conf_dir}/deploymentRegistry.dat"
+    elif [[ -f "$input_path" ]]; then
+        echo "$input_path"
+    elif [[ -f "${input_path}/etc/conf/deploymentRegistry.dat" ]]; then
+        echo "${input_path}/etc/conf/deploymentRegistry.dat"
+    else
+        return 1
+    fi
+}
+
+# DESC: List GoldenGate deployments, show their registry configuration, or
+#       load a deployment's environment (OGG_HOME, TNS_ADMIN, PATH, ...) into
+#       the current shell, using deploymentRegistry.dat as the source of truth.
+function oggenv() {
+    local mode="env"
+    local input_path=""
+    local positional=()
+
+    # 1. Parse flags and positional arguments in any order
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -l|--list)
+                mode="list"
+                shift
+                ;;
+            -g|--get)
+                mode="get"
+                shift
+                ;;
+            -r|--registry)
+                if [[ -z "$2" ]]; then
+                    echo "Error: --registry requires a path argument." >&2
+                    return 1
+                fi
+                input_path="$2"
+                shift 2
+                ;;
+            -h|--help)
+                cat <<'HELP'
+Usage:
+  oggenv                                  List available deployment names
+  oggenv <deployment>                     Export environment variables for <deployment>
+  oggenv -l, --list                       Show full configuration for all deployments
+  oggenv -g, --get <deployment> [param]   Show configuration for <deployment> or raw value of [param]
+  oggenv -r, --registry <path>            Specify custom SM home or deploymentRegistry.dat path
+
+Related helpers:
+  ggac_                                   Launch adminclient from the loaded $OGG_HOME
+  cdgg                                    cd to the loaded $OGG_HOME
+HELP
+                return 0
+                ;;
+            -*)
+                echo "Error: Unknown option '$1'. Use --help for usage." >&2
+                return 1
+                ;;
+            *)
+                positional+=("$1")
+                shift
+                ;;
+        esac
+    done
+
+    local target_dep="${positional[0]:-}"
+    local target_param="${positional[1]:-}"
+
+    # 2. Locate deploymentRegistry.dat
+    local reg_file
+    if ! reg_file=$(_ogg_find_registry "$input_path"); then
+        echo "Error: Could not locate deploymentRegistry.dat." >&2
+        return 1
+    fi
+
+    # 3. Execute Python handler based on mode
+    local output
+    output=$(python3 - "$mode" "$reg_file" "$target_dep" "$target_param" <<'EOF'
+import json
+import shlex
+import sys
+
+mode = sys.argv[1]
+reg_file = sys.argv[2]
+target_dep = sys.argv[3] if len(sys.argv) > 3 and sys.argv[3] else None
+target_param = sys.argv[4] if len(sys.argv) > 4 and sys.argv[4] else None
+
+with open(reg_file, 'r') as f:
+    data = json.load(f)
+
+sorted_deployments = sorted(
+    [k for k, v in data.items() if isinstance(v, dict)],
+    key=lambda k: (k != "ServiceManager", k.lower())
+)
+
+keys_to_show = [
+    ("ID", "id"),
+    ("Status", "status"),
+    ("Enabled", "enabled"),
+    ("oggHome", "oggHome"),
+    ("oggEtcHome", "oggEtcHome"),
+    ("oggConfHome", "oggConfHome"),
+    ("oggVarHome", "oggVarHome"),
+    ("oggDataHome", "oggDataHome"),
+    ("oggSslHome", "oggSslHome"),
+]
+
+def print_deployment_block(dep_name, details):
+    print(f"Deployment   : {dep_name}")
+    for label, key in keys_to_show:
+        if key in details:
+            print(f"  {label:<11}: {details[key]}")
+    env_list = details.get("environment", [])
+    if env_list:
+        print("  Environment:")
+        for env in env_list:
+            print(f"    - {env.get('name')}={env.get('value')}")
+    print("-" * 80)
+
+def prompt_missing_deployment(cmd_hint):
+    print("Available deployments:", file=sys.stderr)
+    for dep in sorted_deployments:
+        print(f"  - {dep}", file=sys.stderr)
+    print(f"\nPlease run the command again and provide a deployment name:\n  {cmd_hint}", file=sys.stderr)
+    sys.exit(1)
+
+# --- MODE: LIST ALL ---
+if mode == "list":
+    print(f"Reading registry: {reg_file}")
+    print("=" * 80)
+    for dep_name in sorted_deployments:
+        print_deployment_block(dep_name, data[dep_name])
+    sys.exit(0)
+
+# --- MODE: GET SINGLE DEPLOYMENT OR PARAMETER ---
+if mode == "get":
+    if not target_dep:
+        prompt_missing_deployment("oggenv --get <deployment_name> [parameter_name]")
+    if target_dep not in data or not isinstance(data[target_dep], dict):
+        print(f"Error: Deployment '{target_dep}' not found in {reg_file}.", file=sys.stderr)
+        sys.exit(1)
+
+    details = data[target_dep]
+    if target_param:
+        if target_param in details:
+            val = details[target_param]
+            print(json.dumps(val, indent=2) if isinstance(val, (dict, list)) else val)
+        else:
+            env_list = details.get("environment", [])
+            env_match = next((e.get("value") for e in env_list if e.get("name") == target_param), None)
+            if env_match is not None:
+                print(env_match)
+            else:
+                print(f"Error: Parameter '{target_param}' not found for '{target_dep}'.", file=sys.stderr)
+                sys.exit(1)
+    else:
+        print(f"Reading registry: {reg_file}")
+        print("=" * 80)
+        print_deployment_block(target_dep, details)
+    sys.exit(0)
+
+# --- MODE: SET ENVIRONMENT VARIABLES (DEFAULT) ---
+if mode == "env":
+    if not target_dep:
+        prompt_missing_deployment("oggenv <deployment_name>")
+    if target_dep not in data or not isinstance(data[target_dep], dict):
+        print(f"Error: Deployment '{target_dep}' not found in {reg_file}.", file=sys.stderr)
+        sys.exit(1)
+
+    details = data[target_dep]
+    key_map = {
+        "oggHome": "OGG_HOME",
+        "oggEtcHome": "OGG_ETC_HOME",
+        "oggConfHome": "OGG_CONF_HOME",
+        "oggVarHome": "OGG_VAR_HOME",
+        "oggDataHome": "OGG_DATA_HOME",
+        "oggSslHome": "OGG_SSL_HOME",
+    }
+
+    lines = [f"export OGG_DEPLOYMENT={shlex.quote(target_dep)}"]
+
+    for json_key, env_var in key_map.items():
+        if json_key in details and details[json_key]:
+            lines.append(f"export {env_var}={shlex.quote(str(details[json_key]))}")
+
+    for env_item in details.get("environment", []):
+        name = env_item.get("name")
+        val = env_item.get("value")
+        if name and val is not None:
+            lines.append(f"export {name}={shlex.quote(str(val))}")
+
+    if "oggHome" in details and details["oggHome"]:
+        ogg_bin = f"{details['oggHome']}/bin"
+        lines.append(f'case ":$PATH:" in *":{ogg_bin}:"*) ;; *) export PATH="{ogg_bin}:$PATH" ;; esac')
+
+    print("\n".join(lines))
+EOF
+)
+
+    local rc=$?
+    if [[ $rc -ne 0 ]]; then
+        return $rc
+    fi
+
+    # 4. Evaluate exports (env mode) or print formatted output (list/get modes)
+    if [[ "$mode" == "env" ]]; then
+        eval "$output"
+        echo "Environment loaded for deployment: $OGG_DEPLOYMENT"
+    else
+        printf '%s\n' "$output"
+    fi
+}
+
+# ==============================================================================
+# Bash Tab-Completion for oggenv
+# ==============================================================================
+_oggenv_complete() {
+    local cur prev
+    cur="${COMP_WORDS[COMP_CWORD]}"
+    prev="${COMP_WORDS[COMP_CWORD-1]}"
+
+    # 1. Complete file/directory paths after --registry or -r
+    if [[ "$prev" == "-r" || "$prev" == "--registry" ]]; then
+        COMPREPLY=( $(compgen -f -- "$cur") )
+        return 0
+    fi
+
+    # 2. Complete flags when current word starts with '-'
+    if [[ "$cur" == -* ]]; then
+        COMPREPLY=( $(compgen -W "-l --list -g --get -r --registry -h --help" -- "$cur") )
+        return 0
+    fi
+
+    # 3. Parse prior arguments to detect --registry path and positional index
+    local reg_arg=""
+    local has_get=0
+    local positional_count=0
+    local i=1
+    while [[ $i -lt $COMP_CWORD ]]; do
+        local word="${COMP_WORDS[$i]}"
+        case "$word" in
+            -r|--registry)
+                if [[ $((i + 1)) -lt $COMP_CWORD ]]; then
+                    reg_arg="${COMP_WORDS[$((i + 1))]}"
+                    ((i++))
+                fi
+                ;;
+            -g|--get)
+                has_get=1
+                ;;
+            -l|--list|-h|--help)
+                ;;
+            *)
+                ((positional_count++))
+                ;;
+        esac
+        ((i++))
+    done
+
+    # 4. Locate deploymentRegistry.dat using shared helper
+    local reg_file
+    reg_file=$(_ogg_find_registry "$reg_arg" 2>/dev/null)
+
+    # 5. Complete deployment names (1st positional arg) or parameters (2nd positional arg with --get)
+    if [[ $positional_count -eq 0 && -f "$reg_file" ]]; then
+        local deployments
+        deployments=$(python3 -c '
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        data = json.load(f)
+    deps = sorted([k for k, v in data.items() if isinstance(v, dict)], key=lambda k: (k != "ServiceManager", k.lower()))
+    print(" ".join(deps))
+except Exception:
+    pass
+' "$reg_file" 2>/dev/null)
+        COMPREPLY=( $(compgen -W "$deployments" -- "$cur") )
+    elif [[ $positional_count -eq 1 && $has_get -eq 1 ]]; then
+        local params="id status enabled oggHome oggEtcHome oggConfHome oggVarHome oggDataHome oggSslHome TNS_ADMIN LD_LIBRARY_PATH JAVA_HOME"
+        COMPREPLY=( $(compgen -W "$params" -- "$cur") )
+    fi
+
+    return 0
+}
+
+complete -F _oggenv_complete oggenv
